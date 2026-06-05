@@ -49,14 +49,11 @@ class CommitResponse(BaseModel):
 
 def get_github_client(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    token: Optional[str] = Query(None, description="GitHub Personal Access Token"),
 ) -> GhApi:
-    """Resolve GitHub token from Bearer header, ?token= query param, or GITHUB_TOKEN env var."""
+    """Resolve GitHub token from the Authorization: Bearer header, or the GITHUB_TOKEN env var."""
     resolved_token = None
     if credentials:
         resolved_token = credentials.credentials
-    elif token:
-        resolved_token = token
     elif os.getenv("GITHUB_TOKEN"):
         resolved_token = os.getenv("GITHUB_TOKEN")
     return GhApi(token=resolved_token)

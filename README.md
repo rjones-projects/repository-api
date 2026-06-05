@@ -19,8 +19,10 @@ Interactive docs: http://localhost:8080/docs
 Pass a GitHub Personal Access Token (PAT) via:
 
 - `Authorization: Bearer <token>` header
-- `?token=<token>` query parameter
 - `GITHUB_TOKEN` environment variable (fallback)
+
+> The token is **never** accepted as a URL query parameter — query strings leak
+> into access logs, browser history, and proxy logs. Always send it as a header.
 
 Scopes needed: `repo` for private repos, `public_repo` for public only.
 
@@ -156,7 +158,7 @@ CATALOG_FILE=catalog.yaml
 
 
 docker build -t repo-api .
-docker run -p 8080:8080 repo-api 
+docker run -p 8083:8080 repo-api 
 
 docker tag repo-api europe-west2-docker.pkg.dev/idp-poc-495014/repo-api/repo-api:latest
 
