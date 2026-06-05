@@ -39,7 +39,6 @@ jobs:
       - name: Build and push image
         run: |
           docker build \
-            --build-arg GITHUB_TOKEN=${{ secrets.GH_TOKEN }} \
             --build-arg NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }} \
             --tag ${{ env.IMAGE }}:${{ github.sha }} \
             --tag ${{ env.IMAGE }}:latest \
@@ -54,3 +53,5 @@ jobs:
           region: ${{ env.REGION }}
           image: ${{ env.IMAGE }}:${{ github.sha }}
           flags: --allow-unauthenticated
+          env_vars: |
+            GITHUB_TOKEN=${{ secrets.GH_TOKEN }}
