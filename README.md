@@ -139,7 +139,7 @@ gcloud iam service-accounts add-iam-policy-binding github-actions@idp-poc-495014
 #create secrets
  Settings → Secrets and variables → Actions → New repository secret
 
-#get the secret - WIF_PROVIDER - added to environment vars - todo: fix pipeline
+#get the secret - WIF_PROVIDER - added to repo secrets - could be vars - todo: fix pipeline
 gcloud iam workload-identity-pools providers describe github-provider --project=idp-poc-495014 --location=global --workload-identity-pool=github-pool --format="value(name)"
 
 #secret - WIF_SERVICE_ACCOUNT
