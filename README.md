@@ -136,6 +136,9 @@ gcloud iam workload-identity-pools providers update-oidc github-provider --proje
 # Allow the pool to impersonate the SA
 gcloud iam service-accounts add-iam-policy-binding github-actions@idp-poc-495014.iam.gserviceaccount.com --project=idp-poc-495014 --role="roles/iam.workloadIdentityUser" --member="principalSet://iam.googleapis.com/projects/$(gcloud projects describe idp-poc-495014 --format='value(projectNumber)')/locations/global/workloadIdentityPools/github-pool/attribute.repository/rjones-projects/repo-api"
 
+#check the policy binding
+gcloud iam service-accounts get-iam-policy github-actions@idp-poc-495014.iam.gserviceaccount.com 
+
 #create secrets
  Settings → Secrets and variables → Actions → New repository secret
 
