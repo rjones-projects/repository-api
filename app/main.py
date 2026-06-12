@@ -18,6 +18,7 @@ from ghapi.all import GhApi
 from fastcore.net import HTTP4xxClientError
 from google.cloud import secretmanager
 from google.api_core.exceptions import GoogleAPIError
+from nacl import encoding, public
 from pydantic import BaseModel, Field
 
 app = FastAPI(
@@ -67,6 +68,7 @@ class CommitResponse(BaseModel):
     created_repo: bool = False
     pull_request_url: Optional[str] = None
     workflow_path: Optional[str] = None
+    modules_secret_set: bool = False
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -353,6 +355,13 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      - name: Authenticate git for Terraform modules
+        env:
+          GH_MODULES_TOKEN: ${{ secrets.GH_MODULES_TOKEN || github.token }}
+        run: |
+          git config --global url."https://x-access-token:${GH_MODULES_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global url."https://x-access-token:${GH_MODULES_TOKEN}@github.com/".insteadOf "git@github.com:"
+
       - name: Terraform Init
         id: init
         run: terraform init -backend=false -input=false
@@ -458,6 +467,20 @@ def _branch_sha(gh: GhApi, owner: str, repo: str, branch: str, attempts: int = 8
     raise _github_error(last_exc) if last_exc else HTTPException(status_code=500, detail="branch not ready")
 
 
+def _set_repo_secret(gh: GhApi, owner: str, repo: str, name: str, value: str) -> None:
+    """Create/update an Actions secret on the repo (libsodium sealed-box encrypted)."""
+    pk = gh.actions.get_repo_public_key(owner=owner, repo=repo)
+    sealed_box = public.SealedBox(public.PublicKey(pk.key.encode("utf-8"), encoding.Base64Encoder()))
+    encrypted = sealed_box.encrypt(value.encode("utf-8"))
+    gh.actions.create_or_update_repo_secret(
+        owner=owner,
+        repo=repo,
+        secret_name=name,
+        encrypted_value=base64.b64encode(encrypted).decode("utf-8"),
+        key_id=pk.key_id,
+    )
+
+
 def _bootstrap_new_repo(
     gh: GhApi, owner: str, repo: str, default_branch: str, files: dict[str, str], request: "CommitRequest"
 ) -> CommitResponse:
@@ -470,6 +493,17 @@ def _bootstrap_new_repo(
     except HTTP4xxClientError as exc:
         if _http_status(exc) != 422:  # 422 = ref already exists
             raise _github_error(exc)
+
+    # Inject the owner PAT so the plan workflow can fetch private Terraform modules.
+    # Must happen before the PR is opened (which triggers the workflow run).
+    modules_secret_set = False
+    token = _resolve_owner_token(owner)
+    if token:
+        try:
+            _set_repo_secret(gh, owner, repo, "GH_MODULES_TOKEN", token)
+            modules_secret_set = True
+        except HTTP4xxClientError:
+            modules_secret_set = False
 
     tf_dir = request.destination.strip("/") or "."
     workflow_path = ".github/workflows/terraform-plan.yml"
@@ -503,6 +537,7 @@ def _bootstrap_new_repo(
         created_repo=True,
         pull_request_url=pr.html_url,
         workflow_path=workflow_path,
+        modules_secret_set=modules_secret_set,
     )
 
 

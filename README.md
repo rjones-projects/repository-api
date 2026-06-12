@@ -132,7 +132,8 @@ Response (newly created repo):
   "files_committed": [".github/workflows/terraform-plan.yml", "infra/main.tf"],
   "created_repo": true,
   "pull_request_url": "https://github.com/owner/IDP-demo-xyz/pull/1",
-  "workflow_path": ".github/workflows/terraform-plan.yml"
+  "workflow_path": ".github/workflows/terraform-plan.yml",
+  "modules_secret_set": true
 }
 ```
 
@@ -140,6 +141,13 @@ Response (newly created repo):
 > owner's **PAT** (a push using the built-in `GITHUB_TOKEN` would not trigger it).
 > The PAT therefore needs `repo` scope, and the repo/org must allow Actions to
 > have `pull-requests: write` for the plan comment to post.
+
+> **Private Terraform modules:** `terraform init` clones module sources from
+> github.com. The built-in `GITHUB_TOKEN` can't read *other* private repos, so on
+> repo creation the owner's PAT is injected as a `GH_MODULES_TOKEN` Actions secret
+> (`modules_secret_set: true`). The workflow's git-auth step uses that secret to
+> authenticate module clones (falling back to `github.token` if it's absent).
+> Setting the secret needs a PAT with `repo` scope and admin on the repo.
 
 ## Docker
 
