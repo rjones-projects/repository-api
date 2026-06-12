@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(
     title="Repo API",
     description="Fetch files from GitHub repositories and commit changes",
-    version="2.0.0",
+    version="2.1.0",
 )
 
 # GCP project that stores the per-owner GitHub PAT secrets (named "<owner>_token").
@@ -64,6 +64,9 @@ class CommitResponse(BaseModel):
     branch: str
     commit_sha: str
     files_committed: list[str]
+    created_repo: bool = False
+    pull_request_url: Optional[str] = None
+    workflow_path: Optional[str] = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -321,10 +324,87 @@ def get_repo_info(owner: str, repo: str, gh: GhApi = Depends(get_github_client))
 
 # ── Commit endpoint ──────────────────────────────────────────────────────────
 
-def _ensure_repo(gh: GhApi, owner: str, repo: str, private: bool) -> str:
-    """Return the default branch of the repo, creating it if it doesn't exist."""
+# Branch a freshly created repo is bootstrapped on (PR'd into the default branch).
+FIRST_COMMIT_BRANCH = "first-commit"
+
+# GitHub Actions workflow committed into new repos. Runs `terraform plan` on each
+# PR and posts the result as a comment. __TF_DIR__ is replaced with the directory
+# the Terraform lives in. The plan output is passed to github-script via env (not
+# string-interpolated into the script) to avoid breakage/injection on special chars.
+_TERRAFORM_PLAN_WORKFLOW = """name: Terraform Plan
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: __TF_DIR__
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -backend=false -input=false
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -input=false
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          PLAN_STDOUT: ${{ steps.plan.outputs.stdout }}
+          PLAN_STDERR: ${{ steps.plan.outputs.stderr }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          INIT_OUTCOME: ${{ steps.init.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+        with:
+          script: |
+            const plan = (process.env.PLAN_STDOUT || process.env.PLAN_STDERR || 'No plan output.').slice(0, 60000);
+            const body = [
+              '#### Terraform Plan `' + process.env.PLAN_OUTCOME + '`',
+              '- init: `' + process.env.INIT_OUTCOME + '`  validate: `' + process.env.VALIDATE_OUTCOME + '`',
+              '',
+              '<details><summary>Show Plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '',
+              '</details>',
+            ].join('\\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+"""
+
+
+def _ensure_repo(gh: GhApi, owner: str, repo: str, private: bool) -> tuple[str, bool]:
+    """Return (default_branch, created) for the repo, creating it if it doesn't exist."""
     try:
-        return gh.repos.get(owner=owner, repo=repo).default_branch
+        return gh.repos.get(owner=owner, repo=repo).default_branch, False
     except HTTP4xxClientError as exc:
         if _http_status(exc) != 404:
             raise _github_error(exc)
@@ -338,7 +418,92 @@ def _ensure_repo(gh: GhApi, owner: str, repo: str, private: bool) -> str:
     except HTTP4xxClientError as exc:
         raise _github_error(exc, default_status=422)
 
-    return r.default_branch
+    return r.default_branch, True
+
+
+def _map_paths(files: dict[str, str], folder: str, destination: str) -> dict[str, str]:
+    """Apply the folder-strip / destination-prefix mapping to commit file paths."""
+    folder_prefix = folder.rstrip("/") + "/" if folder else ""
+    mapped: dict[str, str] = {}
+    for file_path, content in files.items():
+        rel = file_path[len(folder_prefix):] if folder_prefix and file_path.startswith(folder_prefix) else file_path
+        dest = f"{destination.rstrip('/')}/{rel}" if destination else rel
+        mapped[dest.lstrip("/")] = content
+    return mapped
+
+
+def _commit_tree(gh: GhApi, owner: str, repo: str, base_sha: str, files: dict[str, str], message: str) -> str:
+    """Create a single commit on top of base_sha containing files; return its SHA."""
+    base_tree_sha = gh.git.get_commit(owner=owner, repo=repo, commit_sha=base_sha).tree.sha
+    tree_entries = []
+    for path, content in files.items():
+        blob = gh.git.create_blob(owner=owner, repo=repo, content=content, encoding="utf-8")
+        tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob.sha})
+    new_tree = gh.git.create_tree(owner=owner, repo=repo, tree=tree_entries, base_tree=base_tree_sha)
+    new_commit = gh.git.create_commit(owner=owner, repo=repo, message=message, tree=new_tree.sha, parents=[base_sha])
+    return new_commit.sha
+
+
+def _branch_sha(gh: GhApi, owner: str, repo: str, branch: str, attempts: int = 8, delay: float = 0.5) -> str:
+    """Return a branch's head SHA, retrying while a freshly created repo settles."""
+    last_exc = None
+    for _ in range(attempts):
+        try:
+            return gh.git.get_ref(owner=owner, repo=repo, ref=f"heads/{branch}").object.sha
+        except HTTP4xxClientError as exc:
+            last_exc = exc
+            if _http_status(exc) not in (404, 409):
+                raise _github_error(exc)
+            time.sleep(delay)
+    raise _github_error(last_exc) if last_exc else HTTPException(status_code=500, detail="branch not ready")
+
+
+def _bootstrap_new_repo(
+    gh: GhApi, owner: str, repo: str, default_branch: str, files: dict[str, str], request: "CommitRequest"
+) -> CommitResponse:
+    """New-repo flow: push files + a terraform-plan workflow to a first-commit branch
+    and open a PR into the default branch (which triggers the plan-on-PR action)."""
+    base_sha = _branch_sha(gh, owner, repo, default_branch)
+
+    try:
+        gh.git.create_ref(owner=owner, repo=repo, ref=f"refs/heads/{FIRST_COMMIT_BRANCH}", sha=base_sha)
+    except HTTP4xxClientError as exc:
+        if _http_status(exc) != 422:  # 422 = ref already exists
+            raise _github_error(exc)
+
+    tf_dir = request.destination.strip("/") or "."
+    workflow_path = ".github/workflows/terraform-plan.yml"
+    payload = dict(files)
+    payload[workflow_path] = _TERRAFORM_PLAN_WORKFLOW.replace("__TF_DIR__", tf_dir)
+
+    commit_sha = _commit_tree(gh, owner, repo, base_sha, payload, request.message)
+    gh.git.update_ref(owner=owner, repo=repo, ref=f"heads/{FIRST_COMMIT_BRANCH}", sha=commit_sha)
+
+    try:
+        pr = gh.pulls.create(
+            owner=owner,
+            repo=repo,
+            title="First commit",
+            head=FIRST_COMMIT_BRANCH,
+            base=default_branch,
+            body=(
+                "Automated first commit.\n\n"
+                "The **Terraform Plan** workflow runs `terraform plan` on this PR and "
+                "posts the result as a comment."
+            ),
+        )
+    except HTTP4xxClientError as exc:
+        raise _github_error(exc, default_status=422)
+
+    return CommitResponse(
+        repo=f"{owner}/{repo}",
+        branch=FIRST_COMMIT_BRANCH,
+        commit_sha=commit_sha,
+        files_committed=sorted(payload),
+        created_repo=True,
+        pull_request_url=pr.html_url,
+        workflow_path=workflow_path,
+    )
 
 
 @app.post(
@@ -358,55 +523,42 @@ def commit_files(
 ):
     """
     Commit one or more files to a GitHub repo in a single commit.
-    The repo is created automatically if it does not exist.
+
+    If the repo **does not exist** it is created with a `main` branch, the files
+    (plus a Terraform-plan GitHub Actions workflow) are pushed to a `first-commit`
+    branch, and a PR is opened into `main` — the workflow then runs `terraform plan`
+    and comments the result on the PR.
+
+    For an **existing** repo the files are committed straight to `branch`.
 
     - `folder`: source prefix stripped from each file path key
     - `destination`: target directory in the repo where files are placed
-    - `branch`: created from the default branch if it doesn't exist
+    - `branch`: created from the default branch if it doesn't exist (existing repos only)
     """
     if not request.files:
         raise HTTPException(status_code=422, detail="No files provided")
 
-    default_branch = _ensure_repo(gh, owner, repo, request.private)
-    branch = request.branch
+    default_branch, created = _ensure_repo(gh, owner, repo, request.private)
+    files = _map_paths(request.files, request.folder, request.destination)
 
+    if created:
+        return _bootstrap_new_repo(gh, owner, repo, default_branch, files, request)
+
+    branch = request.branch
     try:
-        ref_obj = gh.git.get_ref(owner=owner, repo=repo, ref=f"heads/{branch}")
-        base_sha = ref_obj.object.sha
+        base_sha = gh.git.get_ref(owner=owner, repo=repo, ref=f"heads/{branch}").object.sha
     except HTTP4xxClientError as exc:
         if _http_status(exc) != 404:
             raise _github_error(exc)
-        default_ref = gh.git.get_ref(owner=owner, repo=repo, ref=f"heads/{default_branch}")
-        base_sha = default_ref.object.sha
+        base_sha = gh.git.get_ref(owner=owner, repo=repo, ref=f"heads/{default_branch}").object.sha
         gh.git.create_ref(owner=owner, repo=repo, ref=f"refs/heads/{branch}", sha=base_sha)
 
-    base_tree_sha = gh.git.get_commit(owner=owner, repo=repo, commit_sha=base_sha).tree.sha
-
-    tree_entries = []
-    committed_paths = []
-    folder_prefix = request.folder.rstrip("/") + "/" if request.folder else ""
-
-    for file_path, content in request.files.items():
-        rel = file_path[len(folder_prefix):] if folder_prefix and file_path.startswith(folder_prefix) else file_path
-        dest = f"{request.destination.rstrip('/')}/{rel}" if request.destination else rel
-        dest = dest.lstrip("/")
-
-        blob = gh.git.create_blob(owner=owner, repo=repo, content=content, encoding="utf-8")
-        tree_entries.append({"path": dest, "mode": "100644", "type": "blob", "sha": blob.sha})
-        committed_paths.append(dest)
-
-    new_tree = gh.git.create_tree(owner=owner, repo=repo, tree=tree_entries, base_tree=base_tree_sha)
-    new_commit = gh.git.create_commit(
-        owner=owner, repo=repo,
-        message=request.message,
-        tree=new_tree.sha,
-        parents=[base_sha],
-    )
-    gh.git.update_ref(owner=owner, repo=repo, ref=f"heads/{branch}", sha=new_commit.sha)
+    commit_sha = _commit_tree(gh, owner, repo, base_sha, files, request.message)
+    gh.git.update_ref(owner=owner, repo=repo, ref=f"heads/{branch}", sha=commit_sha)
 
     return CommitResponse(
         repo=f"{owner}/{repo}",
         branch=branch,
-        commit_sha=new_commit.sha,
-        files_committed=committed_paths,
+        commit_sha=commit_sha,
+        files_committed=sorted(files),
     )

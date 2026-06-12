@@ -72,7 +72,14 @@ Query params:
 
 #### `POST /repos/{owner}/{repo}/commit`
 
-Commits one or more files in a single Git commit. **Creates the repository automatically** if it does not exist.
+Commits one or more files in a single Git commit.
+
+- **Existing repo:** files are committed straight to `branch` (created from the
+  default branch if it doesn't exist).
+- **New repo:** the repository is **created automatically** with a `main` branch,
+  then the files — plus a `terraform-plan` GitHub Actions workflow — are pushed to a
+  `first-commit` branch and a **PR is opened into `main`**. The workflow runs
+  `terraform plan` on the PR and posts the result as a comment.
 
 Request body:
 
@@ -101,16 +108,38 @@ Request body:
 
 **Path mapping:** a file keyed `"src/main.tf"` with `folder="src"` and `destination="infra"` is committed as `infra/main.tf`.
 
-Response:
+Response (existing repo):
 
 ```json
 {
   "repo": "owner/my-repo",
   "branch": "main",
   "commit_sha": "abc123...",
-  "files_committed": ["infra/main.tf", "infra/variables.tf"]
+  "files_committed": ["infra/main.tf", "infra/variables.tf"],
+  "created_repo": false,
+  "pull_request_url": null,
+  "workflow_path": null
 }
 ```
+
+Response (newly created repo):
+
+```json
+{
+  "repo": "owner/IDP-demo-xyz",
+  "branch": "first-commit",
+  "commit_sha": "abc123...",
+  "files_committed": [".github/workflows/terraform-plan.yml", "infra/main.tf"],
+  "created_repo": true,
+  "pull_request_url": "https://github.com/owner/IDP-demo-xyz/pull/1",
+  "workflow_path": ".github/workflows/terraform-plan.yml"
+}
+```
+
+> The plan-on-PR workflow runs because the branch push and PR are made with the
+> owner's **PAT** (a push using the built-in `GITHUB_TOKEN` would not trigger it).
+> The PAT therefore needs `repo` scope, and the repo/org must allow Actions to
+> have `pull-requests: write` for the plan comment to post.
 
 ## Docker
 
@@ -194,7 +223,7 @@ printf '%s' 'ghp_newTokenHere' | gcloud secrets versions add octocat_token --pro
 
 
 docker build -t repo-api .
-docker run -p 8083:8080 repo-api 
+docker run -p 8085:8080 repo-api 
 
 docker tag repo-api europe-west2-docker.pkg.dev/idp-poc-495014/repo-api/repo-api:latest
 
